@@ -1,0 +1,249 @@
+//@version=6
+indicator("Minervini Metrics", overlay=true)
+
+sma50 = ta.sma(close, 50)
+sma150 = ta.sma(close, 150)
+sma200 = ta.sma(close, 200)
+sma200_22 = sma200[22]
+
+// Recent listings lack the history for the moving averages; the table row says why it fails
+bars_available = bar_index + 1
+bars_note(required) => bars_available >= required ? "" : "need " + str.tostring(required) + " bars, have " + str.tostring(bars_available)
+
+// Criteria 1, 3 and 4 chain price > sma 50 > sma 150 > sma 200, which also covers
+// price above sma 150/200 and sma 50 above sma 200
+
+// 1. sma 150 is above sma 200
+is_sma_150_above_sma_200 = sma150 > sma200
+
+// 2. sma 200 is trending at least 1 month(22 days)
+is_trending_at_least_1_month = sma200 > sma200_22
+
+// 3. sma 50 is above sma 150
+is_sma_50_above_sma_150 = sma50 > sma150
+
+// 4. current stock price is above sma 50
+is_current_price_above_ma_50 = close > sma50
+
+// 5. current stock price is 25% above 52 weeks low
+// Many of the best are up 100-300% before coming out of consolidation
+high_loopback = input(260, "High Lookback Length")
+low_loopback = input(260, "Low Lookback Length")
+
+// Use whatever history exists (capped at the lookback) so recent listings still get
+// 52 week checks, like weighted RS does; the table row notes when the range is partial
+history_note(lookback) => bars_available >= lookback ? "" : "partial: " + str.tostring(bars_available) + " of " + str.tostring(lookback) + " bars"
+
+highest_price = ta.highest(high, math.min(bars_available, high_loopback))
+lowest_price = ta.lowest(low, math.min(bars_available, low_loopback))
+
+is_price_25_percent_above_52_weeks_low = ((close/lowest_price)-1) * 100 >= 25
+
+// Show 52 High / Low Line 
+show_52_week_high_low = input.bool(defval = true, title="Show 52 week highest/lowest")
+plot(show_52_week_high_low ? highest_price: na, title='52 Week High', trackprice=true, color=color.orange, offset=-9999)
+plot(show_52_week_high_low ? lowest_price: na, title='52 Week Low', trackprice=true, color=color.orange, offset=-9999)
+
+// 6. Current Price is within 25% of 52 week high
+is_price_within_52_high = (1-(close/highest_price)) * 100 <= 25
+
+// 7. Weighted RS vs benchmark is at or above threshold
+// weighted excess return over the benchmark across 3/6/9/12 months
+var groupRS = 'Weighted RS'
+benchmark = input.symbol("AMEX:SPY", "Benchmark", group=groupRS)
+w1 = input.float(40, "Weight: 3-month excess return",  minval=0, group=groupRS, display=display.none)
+w2 = input.float(20, "Weight: 6-month excess return",  minval=0, group=groupRS, display=display.none)
+w3 = input.float(20, "Weight: 9-month excess return",  minval=0, group=groupRS, display=display.none)
+w4 = input.float(20, "Weight: 12-month excess return", minval=0, group=groupRS, display=display.none)
+rs_threshold = input.float(10, "Weighted RS threshold (%)", group=groupRS)
+
+// Current close plus closes ~3/6/9/12 months ago (63/126/189/252 trading days).
+// Always pulled from daily data so the lookbacks stay correct on any chart timeframe.
+closes() => [close, close[63], close[126], close[189], close[252]]
+
+[s0, s3, s6, s9, s12] = request.security(syminfo.tickerid, "D", closes())
+[b0, b3, b6, b9, b12] = request.security(benchmark, "D", closes())
+
+// Stock return minus benchmark return over the same window
+excess(sNow, sPast, bNow, bPast) => sNow / sPast - bNow / bPast
+
+// Weighted average over only the windows that have data, so recent listings
+// without 12 months of history still get a rating from the shorter windows
+sPasts = array.from(s3, s6, s9, s12)
+bPasts = array.from(b3, b6, b9, b12)
+weights = array.from(w1, w2, w3, w4)
+
+rs_sum = 0.0
+rs_weight = 0.0
+rs_windows = 0
+for i = 0 to sPasts.size() - 1
+    sPast = sPasts.get(i)
+    bPast = bPasts.get(i)
+    if not na(sPast) and not na(bPast)
+        rs_sum += weights.get(i) * excess(s0, sPast, b0, bPast)
+        rs_weight += weights.get(i)
+        rs_windows += 1
+
+weighted_rs = rs_weight > 0 ? 100 * rs_sum / rs_weight : na
+weighted_rs_str = na(weighted_rs) ? "n/a" : str.tostring(weighted_rs, "#.00") + "%" + (rs_windows < sPasts.size() ? ", " + str.tostring(rs_windows) + " of " + str.tostring(sPasts.size()) + " windows" : "")
+is_weighted_rs_above_threshold = weighted_rs >= rs_threshold
+
+// 9. Average daily volume over the last 30 trading days is at least a threshold (liquidity).
+// Always pulled from daily data so it stays shares per day on any chart timeframe.
+var groupVolume = 'Average volume'
+avg_volume_length = input.int(30, "Average volume length (days)", minval=1, group=groupVolume)
+min_avg_volume = input.float(200000, "Min average daily volume (shares)", minval=0, group=groupVolume)
+avg_volume = request.security(syminfo.tickerid, "D", ta.sma(volume, avg_volume_length))
+avg_volume_str = na(avg_volume) ? "need " + str.tostring(avg_volume_length) + " days of volume" : str.tostring(avg_volume, format.volume)
+is_avg_volume_above_threshold = avg_volume >= min_avg_volume
+
+// Quarterly fundamentals (criteria 8 and 10-12): diluted EPS is checked for YoY growth at or
+// above a threshold; EPS, revenue and net margin for the direction of their YoY growth trend
+
+// All quarters of `financial_id` reported within the loaded chart history, oldest first.
+// gaps_on gives a value only on the bar where a new quarter is reported, so each quarter
+// is recorded once (even if two quarters report the same value).
+quarterly(financial_id) =>
+    reported = request.financial(syminfo.tickerid, financial_id, "FQ", barmerge.gaps_on, ignore_invalid_symbol=true)
+    var quarters = array.new<float>()
+    if not na(reported)
+        quarters.push(reported)
+    quarters
+
+// YoY growth (%) of the quarter `back` quarters before the latest. Measured against the
+// size of the year-ago value, so improving from a loss counts as growth (-0.10 -> 0.05 is
+// +150%). na when the year-ago quarter is missing or exactly zero.
+yoy(quarters, back) =>
+    i = quarters.size() - 1 - back
+    prior = i >= 4 ? quarters.get(i - 4) : na
+    not na(prior) and prior != 0 ? 100 * (quarters.get(i) - prior) / math.abs(prior) : na
+
+// 2 quarter rolling average of YoY growth
+yoy_avg2(quarters, back) => (yoy(quarters, back) + yoy(quarters, back + 1)) / 2
+
+// 1 when the 2Q average rose vs the quarter before, -1 when it fell (or was flat), na without data
+trend_dir(quarters, back) =>
+    cur = yoy_avg2(quarters, back)
+    prev = yoy_avg2(quarters, back + 1)
+    na(cur) or na(prev) ? na : cur > prev ? 1 : -1
+
+// "3 qtrs", or "3+ qtrs" when the count reached the oldest data loaded and may run further back
+qtrs_str(n, open_ended) => str.tostring(n) + (open_ended ? "+" : "") + (n == 1 ? " qtr" : " qtrs")
+
+// How many of the most recent quarters in a row had YoY growth >= threshold, plus a table note
+growth_streak(quarters, threshold) =>
+    // quarters that have a year-ago quarter to compare against
+    comparable = math.max(quarters.size() - 4, 0)
+    streak = 0
+    while streak < comparable and yoy(quarters, streak) >= threshold
+        streak += 1
+    latest = yoy(quarters, 0)
+    note = quarters.size() == 0 ? "no data" :
+         comparable == 0 ? "need 5 quarters, have " + str.tostring(quarters.size()) :
+         (na(latest) ? "latest n/a" : "latest " + str.tostring(latest, "#.0") + "%") + ", " + qtrs_str(streak, streak == comparable) + " in a row"
+    [streak, note]
+
+// Direction of the YoY growth trend (1 up, -1 down, na) and how many quarters in a row it
+// has kept that direction, regardless of size, plus a table note
+growth_trend(quarters) =>
+    // quarters that have a direction: each needs its own YoY plus the two before it
+    comparable = math.max(quarters.size() - 6, 0)
+    dir = trend_dir(quarters, 0)
+    len = 0
+    while len < comparable and trend_dir(quarters, len) == dir
+        len += 1
+    note = quarters.size() == 0 ? "no data" :
+         comparable == 0 ? "need 7 quarters, have " + str.tostring(quarters.size()) :
+         na(dir) ? "n/a" :
+         (dir == 1 ? "up " : "down ") + qtrs_str(len, len == comparable) + ", 2Q avg " + str.tostring(yoy_avg2(quarters, 0), "#.0") + "% vs " + str.tostring(yoy_avg2(quarters, 1), "#.0") + "%"
+    [dir, note]
+
+// 8. Diluted EPS growth vs the same quarter a year earlier is at or above threshold
+// for at least the most recent n quarters in a row
+// 10. YoY diluted EPS growth is trending up: the 2 quarter rolling average of YoY growth
+// is higher than the previous quarter's 2 quarter average
+var groupEPS = 'EPS growth'
+eps_growth_threshold = input.float(20, "Min YoY diluted EPS growth (%)", group=groupEPS)
+eps_min_quarters = input.int(1, "Min consecutive quarters", minval=1, group=groupEPS)
+
+eps_quarters = quarterly("EARNINGS_PER_SHARE_DILUTED")
+[eps_streak, eps_note] = growth_streak(eps_quarters, eps_growth_threshold)
+[eps_trend, eps_trend_note] = growth_trend(eps_quarters)
+is_eps_growth_above_threshold = eps_streak >= eps_min_quarters
+is_eps_trend_up = eps_trend == 1
+
+// 11. YoY revenue growth is trending up (2 quarter rolling average, as for EPS)
+[revenue_trend, revenue_trend_note] = growth_trend(quarterly("TOTAL_REVENUE"))
+is_revenue_trend_up = revenue_trend == 1
+
+// 12. YoY net margin growth is trending up (2 quarter rolling average, as for EPS)
+[net_margin_trend, net_margin_trend_note] = growth_trend(quarterly("NET_MARGIN"))
+is_net_margin_trend_up = net_margin_trend == 1
+
+checks = array.from(is_sma_150_above_sma_200, is_trending_at_least_1_month, is_sma_50_above_sma_150,is_current_price_above_ma_50, is_price_25_percent_above_52_weeks_low, is_price_within_52_high, is_weighted_rs_above_threshold, is_eps_growth_above_threshold, is_avg_volume_above_threshold, is_eps_trend_up, is_revenue_trend_up, is_net_margin_trend_up)
+
+count = 0
+for c in checks
+    count += c ? 1 : 0
+
+is_meet_all_criteria = count == checks.size()
+
+// Raw values for automated readers: shown in the data window only, nothing drawn on the chart
+plot(count, "Criteria met", display=display.data_window)
+plot(weighted_rs, "Weighted RS %", display=display.data_window)
+plot(avg_volume, "Avg daily volume", display=display.data_window)
+plot(is_sma_150_above_sma_200 ? 1 : 0, "1 MA150 > MA200", display=display.data_window)
+plot(is_sma_50_above_sma_150 ? 1 : 0, "2 MA50 > MA150", display=display.data_window)
+plot(is_current_price_above_ma_50 ? 1 : 0, "3 Price > MA50", display=display.data_window)
+plot(is_trending_at_least_1_month ? 1 : 0, "4 MA200 rising 1M", display=display.data_window)
+plot(is_price_25_percent_above_52_weeks_low ? 1 : 0, "5 25% above 52W low", display=display.data_window)
+plot(is_price_within_52_high ? 1 : 0, "6 Within 25% of 52W high", display=display.data_window)
+plot(is_weighted_rs_above_threshold ? 1 : 0, "7 Weighted RS", display=display.data_window)
+plot(is_eps_growth_above_threshold ? 1 : 0, "8 EPS YoY growth", display=display.data_window)
+plot(is_avg_volume_above_threshold ? 1 : 0, "9 Avg volume", display=display.data_window)
+plot(is_eps_trend_up ? 1 : 0, "10 EPS trend up", display=display.data_window)
+plot(is_revenue_trend_up ? 1 : 0, "11 Revenue trend up", display=display.data_window)
+plot(is_net_margin_trend_up ? 1 : 0, "12 Net margin trend up", display=display.data_window)
+
+// table section
+
+var groupPanel = 'minervini_criteria'
+string table_vertical_pos = input.string('bottom', 'Panel position', inline='11', options=['top', 'middle', 'bottom'], group=groupPanel)
+string table_horizontal_pos = input.string('right', '', inline='11', options=['left', 'center', 'right'], group=groupPanel)
+
+text_color = color.black
+
+fn_fill_header(_id, _row) => 
+    table.cell(table_id=_id, column=0, row=_row, text='Criteria', width=0, height=0, text_color=text_color, text_size=size.small, bgcolor=color.aqua)
+    // Symbol in the header lets automated readers confirm the table matches the loaded chart
+    table.cell(table_id=_id, column=1, row=_row, text=syminfo.tickerid, width=0, height=0, text_color=text_color, text_size=size.small, bgcolor=color.aqua)
+
+fn_fill_value(_id, _row, criteria, value, _color_value) => 
+    table.cell(table_id=_id, column=0, row=_row, text=criteria, width=0, height=0, text_color=text_color, text_size=size.small, bgcolor=color.white)
+    table.cell(table_id=_id, column=1, row=_row, text=value, width=0, height=0, text_color=text_color, text_size=size.small, bgcolor=_color_value)
+
+// Renders a pass/fail row; detail (if given) is appended in parentheses
+fn_fill_check(_id, _row, criteria, _passed, detail = "") =>
+    value = (_passed ? 'yes' : 'no') + (detail == "" ? "" : " (" + detail + ")")
+    fn_fill_value(_id, _row, criteria, value, _passed ? color.aqua : color.red)
+
+var T = table.new(
+     position= table_vertical_pos + "_" + table_horizontal_pos, columns=2, rows=14, bgcolor=color.white, 
+     frame_color=color.gray, frame_width=2, border_color=color.gray, border_width=1)
+
+
+if barstate.islastconfirmedhistory
+    fn_fill_header(T, 0)
+    fn_fill_check(T, 1, 'MA 150 is above MA 200', is_sma_150_above_sma_200, bars_note(200))
+    fn_fill_check(T, 2, 'MA 50 is above MA 150', is_sma_50_above_sma_150, bars_note(150))
+    fn_fill_check(T, 3, 'Current price is trading above MA 50', is_current_price_above_ma_50, bars_note(50))
+    fn_fill_check(T, 4, 'MA 200 is trending at least 1 month(22 days)', is_trending_at_least_1_month, bars_note(200 + 22))
+    fn_fill_check(T, 5, 'Current price is 25% above 52 weeks low', is_price_25_percent_above_52_weeks_low, history_note(low_loopback))
+    fn_fill_check(T, 6, 'Current price is within 25% of 52 week high', is_price_within_52_high, history_note(high_loopback))
+    fn_fill_check(T, 7, 'Weighted RS at least ' + str.tostring(rs_threshold) + '%', is_weighted_rs_above_threshold, weighted_rs_str)
+    fn_fill_check(T, 8, 'Diluted EPS up at least ' + str.tostring(eps_growth_threshold) + '% YoY for last ' + str.tostring(eps_min_quarters) + ' qtr(s)', is_eps_growth_above_threshold, eps_note)
+    fn_fill_check(T, 9, 'Avg volume (' + str.tostring(avg_volume_length) + ' days) at least ' + str.tostring(min_avg_volume, format.volume), is_avg_volume_above_threshold, avg_volume_str)
+    fn_fill_check(T, 10, 'Diluted EPS YoY growth trending up (2Q avg)', is_eps_trend_up, eps_trend_note)
+    fn_fill_check(T, 11, 'Revenue YoY growth trending up (2Q avg)', is_revenue_trend_up, revenue_trend_note)
+    fn_fill_check(T, 12, 'Net margin YoY growth trending up (2Q avg)', is_net_margin_trend_up, net_margin_trend_note)
+    fn_fill_value(T, 13, 'Meet minervini criteria', " (" + str.tostring(count, "0") + " of " + str.tostring(checks.size()) + ")", color.white)
