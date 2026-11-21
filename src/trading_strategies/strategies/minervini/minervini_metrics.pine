@@ -4,7 +4,6 @@ indicator("Minervini Metrics", overlay=true)
 sma50 = ta.sma(close, 50)
 sma150 = ta.sma(close, 150)
 sma200 = ta.sma(close, 200)
-sma200_22 = sma200[22]
 
 // Recent listings lack the history for the moving averages; the table row says why it fails
 bars_available = bar_index + 1
@@ -16,8 +15,20 @@ bars_note(required) => bars_available >= required ? "" : "need " + str.tostring(
 // 1. sma 150 is above sma 200
 is_sma_150_above_sma_200 = sma150 > sma200
 
-// 2. sma 200 is trending at least 1 month(22 days)
-is_trending_at_least_1_month = sma200 > sma200_22
+// 2. sma 200 has risen every day for at least 1 month (22 trading days)
+ma200_min_rising_days = input.int(22, "MA 200 min rising days in a row", minval=1)
+
+// How many days in a row sma 200 has moved in its current direction (1 rising, -1 falling)
+ma200_dir = math.sign(sma200 - sma200[1])
+var int ma200_dir_days = 0
+ma200_dir_days := na(ma200_dir) ? 0 : ma200_dir == ma200_dir[1] ? ma200_dir_days + 1 : 1
+
+is_trending_at_least_1_month = ma200_dir == 1 and ma200_dir_days >= ma200_min_rising_days
+
+// "+" when the run goes back to the first day sma 200 can be compared, so it may be longer
+ma200_trend_note = bars_available < 200 + ma200_min_rising_days ? bars_note(200 + ma200_min_rising_days) :
+     (ma200_dir == 1 ? "rising " : ma200_dir == -1 ? "falling " : "flat ") + str.tostring(ma200_dir_days) +
+     (ma200_dir_days == bars_available - 200 ? "+" : "") + (ma200_dir_days == 1 ? " day" : " days")
 
 // 3. sma 50 is above sma 150
 is_sma_50_above_sma_150 = sma50 > sma150
@@ -98,7 +109,8 @@ avg_volume_str = na(avg_volume) ? "need " + str.tostring(avg_volume_length) + " 
 is_avg_volume_above_threshold = avg_volume >= min_avg_volume
 
 // Quarterly fundamentals (criteria 8 and 10-12): diluted EPS is checked for YoY growth at or
-// above a threshold; EPS, revenue and net margin for the direction of their YoY growth trend
+// above a threshold; EPS, revenue and net margin for the direction of their YoY growth trend;
+// revenue (criterion 15) for YoY growth at or above a threshold
 
 // All quarters of `financial_id` reported within the loaded chart history, oldest first.
 // gaps_on gives a value only on the bar where a new quarter is reported, so each quarter
@@ -173,14 +185,68 @@ is_eps_growth_above_threshold = eps_streak >= eps_min_quarters
 is_eps_trend_up = eps_trend == 1
 
 // 11. YoY revenue growth is trending up (2 quarter rolling average, as for EPS)
-[revenue_trend, revenue_trend_note] = growth_trend(quarterly("TOTAL_REVENUE"))
+revenue_quarters = quarterly("TOTAL_REVENUE")
+[revenue_trend, revenue_trend_note] = growth_trend(revenue_quarters)
 is_revenue_trend_up = revenue_trend == 1
 
 // 12. YoY net margin growth is trending up (2 quarter rolling average, as for EPS)
 [net_margin_trend, net_margin_trend_note] = growth_trend(quarterly("NET_MARGIN"))
 is_net_margin_trend_up = net_margin_trend == 1
 
-checks = array.from(is_sma_150_above_sma_200, is_trending_at_least_1_month, is_sma_50_above_sma_150,is_current_price_above_ma_50, is_price_25_percent_above_52_weeks_low, is_price_within_52_high, is_weighted_rs_above_threshold, is_eps_growth_above_threshold, is_avg_volume_above_threshold, is_eps_trend_up, is_revenue_trend_up, is_net_margin_trend_up)
+// 13. The latest quarter's reported EPS beat the analysts' estimate (positive earnings surprise)
+
+// Reported EPS and the estimate for each quarter within the loaded chart history, oldest
+// first. As in quarterly(), gaps_on gives a value only on the bar where a quarter is
+// reported. The estimate is na for quarters no analyst covered.
+earnings_quarters() =>
+    actual = request.earnings(syminfo.tickerid, earnings.actual, barmerge.gaps_on, ignore_invalid_symbol=true)
+    estimate = request.earnings(syminfo.tickerid, earnings.estimate, barmerge.gaps_on, ignore_invalid_symbol=true)
+    var actuals = array.new<float>()
+    var estimates = array.new<float>()
+    if not na(actual)
+        actuals.push(actual)
+        estimates.push(estimate)
+    [actuals, estimates]
+
+// 1 when the quarter `back` quarters before the latest beat its estimate, -1 when it missed
+// or matched it, na when there is no estimate
+surprise_dir(actuals, estimates, back) =>
+    i = actuals.size() - 1 - back
+    est = i >= 0 ? estimates.get(i) : na
+    na(est) ? na : actuals.get(i) > est ? 1 : -1
+
+// Whether the latest quarter beat (1 / -1 / na), its surprise (%) and a table note with the
+// size of the surprise and how many quarters in a row have beaten (or not beaten)
+earnings_surprise(actuals, estimates) =>
+    n = actuals.size()
+    dir = surprise_dir(actuals, estimates, 0)
+    len = 0
+    while len < n and surprise_dir(actuals, estimates, len) == dir
+        len += 1
+    diff = n > 0 ? actuals.last() - estimates.last() : na
+    est = n > 0 ? estimates.last() : na
+    pct = not na(est) and est != 0 ? 100 * diff / math.abs(est) : na
+    amount = str.tostring(math.abs(diff), "0.00") + (na(pct) ? "" : " (" + str.tostring(math.abs(pct), "0.0") + "%)")
+    note = n == 0 ? "no data" :
+         na(dir) ? "no estimate for latest qtr" :
+         (diff > 0 ? "beat by " + amount : diff < 0 ? "missed by " + amount : "met estimate") + ", " + (dir == 1 ? "beat " : "no beat ") + qtrs_str(len, len == n) + " in a row"
+    [dir, pct, note]
+
+[actuals, estimates] = earnings_quarters()
+[surprise, surprise_pct, surprise_note] = earnings_surprise(actuals, estimates)
+is_earnings_beat = surprise == 1
+
+// 14. The latest quarter's diluted EPS is positive (a profit, not a loss)
+latest_eps = eps_quarters.size() > 0 ? eps_quarters.last() : na
+latest_eps_note = na(latest_eps) ? "no data" : "latest " + str.tostring(latest_eps, "0.00")
+is_latest_eps_positive = latest_eps > 0
+
+// 15. The latest quarter's revenue grew at least a threshold vs the same quarter a year earlier
+revenue_growth_threshold = input.float(15, "Min YoY revenue growth, latest qtr (%)", group='Revenue growth')
+[revenue_streak, revenue_note] = growth_streak(revenue_quarters, revenue_growth_threshold)
+is_revenue_growth_above_threshold = revenue_streak >= 1
+
+checks = array.from(is_sma_150_above_sma_200, is_trending_at_least_1_month, is_sma_50_above_sma_150,is_current_price_above_ma_50, is_price_25_percent_above_52_weeks_low, is_price_within_52_high, is_weighted_rs_above_threshold, is_eps_growth_above_threshold, is_avg_volume_above_threshold, is_eps_trend_up, is_revenue_trend_up, is_net_margin_trend_up, is_earnings_beat, is_latest_eps_positive, is_revenue_growth_above_threshold)
 
 count = 0
 for c in checks
@@ -192,10 +258,12 @@ is_meet_all_criteria = count == checks.size()
 plot(count, "Criteria met", display=display.data_window)
 plot(weighted_rs, "Weighted RS %", display=display.data_window)
 plot(avg_volume, "Avg daily volume", display=display.data_window)
+plot(surprise_pct, "Earnings surprise %", display=display.data_window)
+plot(ma200_dir * ma200_dir_days, "MA200 trend days (+ rising, - falling)", display=display.data_window)
 plot(is_sma_150_above_sma_200 ? 1 : 0, "1 MA150 > MA200", display=display.data_window)
 plot(is_sma_50_above_sma_150 ? 1 : 0, "2 MA50 > MA150", display=display.data_window)
 plot(is_current_price_above_ma_50 ? 1 : 0, "3 Price > MA50", display=display.data_window)
-plot(is_trending_at_least_1_month ? 1 : 0, "4 MA200 rising 1M", display=display.data_window)
+plot(is_trending_at_least_1_month ? 1 : 0, "4 MA200 rising N days", display=display.data_window)
 plot(is_price_25_percent_above_52_weeks_low ? 1 : 0, "5 25% above 52W low", display=display.data_window)
 plot(is_price_within_52_high ? 1 : 0, "6 Within 25% of 52W high", display=display.data_window)
 plot(is_weighted_rs_above_threshold ? 1 : 0, "7 Weighted RS", display=display.data_window)
@@ -204,6 +272,9 @@ plot(is_avg_volume_above_threshold ? 1 : 0, "9 Avg volume", display=display.data
 plot(is_eps_trend_up ? 1 : 0, "10 EPS trend up", display=display.data_window)
 plot(is_revenue_trend_up ? 1 : 0, "11 Revenue trend up", display=display.data_window)
 plot(is_net_margin_trend_up ? 1 : 0, "12 Net margin trend up", display=display.data_window)
+plot(is_earnings_beat ? 1 : 0, "13 Earnings beat estimate", display=display.data_window)
+plot(is_latest_eps_positive ? 1 : 0, "14 Latest EPS positive", display=display.data_window)
+plot(is_revenue_growth_above_threshold ? 1 : 0, "15 Revenue YoY growth", display=display.data_window)
 
 // table section
 
@@ -228,16 +299,18 @@ fn_fill_check(_id, _row, criteria, _passed, detail = "") =>
     fn_fill_value(_id, _row, criteria, value, _passed ? color.aqua : color.red)
 
 var T = table.new(
-     position= table_vertical_pos + "_" + table_horizontal_pos, columns=2, rows=14, bgcolor=color.white, 
+     position= table_vertical_pos + "_" + table_horizontal_pos, columns=2, rows=17, bgcolor=color.white, 
      frame_color=color.gray, frame_width=2, border_color=color.gray, border_width=1)
 
 
-if barstate.islastconfirmedhistory
+// Drawn on the latest bar, live or closed, so the table matches the data window
+// (barstate.islastconfirmedhistory would judge the bar before a live bar, i.e. yesterday)
+if barstate.islast
     fn_fill_header(T, 0)
     fn_fill_check(T, 1, 'MA 150 is above MA 200', is_sma_150_above_sma_200, bars_note(200))
     fn_fill_check(T, 2, 'MA 50 is above MA 150', is_sma_50_above_sma_150, bars_note(150))
     fn_fill_check(T, 3, 'Current price is trading above MA 50', is_current_price_above_ma_50, bars_note(50))
-    fn_fill_check(T, 4, 'MA 200 is trending at least 1 month(22 days)', is_trending_at_least_1_month, bars_note(200 + 22))
+    fn_fill_check(T, 4, 'MA 200 is trending up at least ' + str.tostring(ma200_min_rising_days) + ' days in a row', is_trending_at_least_1_month, ma200_trend_note)
     fn_fill_check(T, 5, 'Current price is 25% above 52 weeks low', is_price_25_percent_above_52_weeks_low, history_note(low_loopback))
     fn_fill_check(T, 6, 'Current price is within 25% of 52 week high', is_price_within_52_high, history_note(high_loopback))
     fn_fill_check(T, 7, 'Weighted RS at least ' + str.tostring(rs_threshold) + '%', is_weighted_rs_above_threshold, weighted_rs_str)
@@ -246,4 +319,7 @@ if barstate.islastconfirmedhistory
     fn_fill_check(T, 10, 'Diluted EPS YoY growth trending up (2Q avg)', is_eps_trend_up, eps_trend_note)
     fn_fill_check(T, 11, 'Revenue YoY growth trending up (2Q avg)', is_revenue_trend_up, revenue_trend_note)
     fn_fill_check(T, 12, 'Net margin YoY growth trending up (2Q avg)', is_net_margin_trend_up, net_margin_trend_note)
-    fn_fill_value(T, 13, 'Meet minervini criteria', " (" + str.tostring(count, "0") + " of " + str.tostring(checks.size()) + ")", color.white)
+    fn_fill_check(T, 13, 'Latest qtr EPS beat estimate', is_earnings_beat, surprise_note)
+    fn_fill_check(T, 14, 'Latest qtr diluted EPS positive', is_latest_eps_positive, latest_eps_note)
+    fn_fill_check(T, 15, 'Latest qtr revenue up at least ' + str.tostring(revenue_growth_threshold) + '% YoY', is_revenue_growth_above_threshold, revenue_note)
+    fn_fill_value(T, 16, 'Meet minervini criteria', " (" + str.tostring(count, "0") + " of " + str.tostring(checks.size()) + ")", color.white)

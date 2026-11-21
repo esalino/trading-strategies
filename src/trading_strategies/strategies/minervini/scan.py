@@ -19,7 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from trading_strategies.strategies.minervini.watchlist import write_watchlist
+from trading_strategies.strategies.minervini.watchlist import scan_status, write_watchlist
 from trading_strategies.tradingview import cli
 from trading_strategies.tradingview.screener import read_screener_csv
 
@@ -135,7 +135,7 @@ def main() -> None:
                 start = time.monotonic()
                 try:
                     record.update(scan_symbol(symbol, args.timeout, args.poll))
-                    status = f"criteria met: {table_count(record['criteria'])}"
+                    status = scan_status(record)
                     if record.get("values_stale"):
                         status += "  (data-window values don't match the table; is the mouse over the chart?)"
                     ok += 1
